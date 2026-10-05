@@ -4,6 +4,11 @@
 `小节:拍:tick` 与时间（秒）之间双向换算，支持 **PPQ**、**只在小节首拍
 生效的拍号表**，以及 **阶梯（step）/ 线性（linear）BPM** 速度点。
 
+此外提供**带录音锚点的速度图修订发布**：创建谱例时冻结各锚点按原图计算
+的秒数与“该位置一个 tick 的时长”，可凭**修订号（乐观锁）**预览、发布
+整份替换速度点表；发布时锁定锚点偏移超过录入时一 tick 即 **422**，
+修订号过期即 **409**；数据保存在 **SQLite**，Compose 重启后仍可读取。
+
 - 位置中的“拍”按**当前拍号分母**对应的音符计（6/8 中一拍 = 八分音符）；
 - 内部统一展开为“距乐谱起点的 **tick 坐标**”（PPQ：每四分音符的 tick 数）；
 - 线性速度段按解析积分换算，反向换算在**同一速度段内解析求逆**；
@@ -19,6 +24,7 @@
 - [一键启动（Docker Compose）](#一键启动docker-compose)
 - [本地直接运行](#本地直接运行)
 - [接口地址与交互式文档](#接口地址与交互式文档)
+- [录音锚点修订：创建 / 预览 / 发布](#录音锚点修订创建--预览--发布)
 - [约定与规则](#约定与规则)
 - [请求字段](#请求字段)
 - [响应字段](#响应字段)
@@ -41,10 +47,19 @@ docker compose up --build
 
 - 本机地址：<http://localhost:8000>
 - 健康检查：<http://localhost:8000/health>
-- 接口：`POST http://localhost:8000/convert`
+- 换算接口：`POST http://localhost:8000/convert`
+- 创建谱例：`POST http://localhost:8000/scores`
+- 预览修订：`POST http://localhost:8000/scores/{id}/revisions/{rev}/preview`
+- 发布修订：`POST http://localhost:8000/scores/{id}/revisions/{rev}/publish`
+- 查询谱例：`GET  http://localhost:8000/scores/{id}`
 - Swagger 交互文档：<http://localhost:8000/docs>
 - ReDoc：<http://localhost:8000/redoc>
 - OpenAPI Schema：<http://localhost:8000/openapi.json>
+
+谱例与锚点保存在容器内 `/data/tempo.db`（SQLite），并挂载到命名卷
+`tempo-data`：`docker compose down`（保留卷）后再 `up`，已创建与发布的
+修订仍可读取；如需清空，执行 `docker compose down -v`。数据库路径可用
+环境变量 `TEMPO_DB_PATH` 覆盖（本地裸跑默认 `./data/tempo.db`）。
 
 停止：`docker compose down`（后台运行：`docker compose up --build -d`）。
 
@@ -57,6 +72,167 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 地址同上。
+
+---
+
+## 录音锚点修订：创建 / 预览 / 发布
+
+适用于“已有一份速度图和若干**录音锚点**，随后想整份替换速度点表，但
+不希望已锁定的录音时刻被改动”的修订发布流程。修订号采用**乐观锁**：
+创建时为 `0`，每次成功发布 `+1`。
+
+### 规则
+
+1. **创建** `POST /scores`：提交现有 `ppq`、`time_signatures`、
+   `tempo_points` 与锚点表 `anchors`（每项 `{position, locked}`，
+   **至少一个 `locked=true`**）。服务端按**原图**计算并保存：
+   - 每个锚点的秒数 `original_seconds`（= 创建时的 `current_seconds`）；
+   - 该锚点位置**录入时一个 tick 的时长** `tick_seconds`（线性段也按
+     同一套解析积分计时计算），作为日后锁定偏移的阈值。
+
+   返回谱例 `id` 与修订号 `revision: 0`。
+2. **预览** `POST /scores/{id}/revisions/{expected_revision}/preview`：
+   提交**整份替换**速度点表（PPQ、拍号沿用创建时的值，校验同
+   `/convert`）。返回每个锚点的 `original_seconds`、`new_seconds`、
+   `offset_seconds`（new − original，带符号）与 `lock_conflict`，
+   以及整体 `has_lock_conflict`。**预览不修改任何已存数据**；
+   `expected_revision` 与当前修订号不一致时返回 **409**。
+3. **发布** `POST /scores/{id}/revisions/{expected_revision}/publish`：
+   按**当前修订**重新计算：
+   - 任一**锁定**锚点新秒数相对创建时保存的秒数，偏移绝对值
+     **严格超过**该锚点录入时一 tick 的时长（`tick_seconds`），
+     返回带锚点 `index` 的 **422**，**数据不变**（偏移恰好等于
+     一 tick 不视为超过，允许发布）；
+   - 成功则在**单事务**内一次更新速度图、**未锁定**锚点的
+     `current_seconds` 与修订号；**锁定锚点秒数保持创建时的值不变**。
+4. **并发**：预览后若已有其他发布，旧的预期修订号再次发布/预览仍返回
+   **409**（响应体含 `expected_revision` 与 `current_revision`），
+   不会覆盖新版本。
+5. **查询** `GET /scores/{id}`：返回**同一版本**的速度图、修订号与锚点
+   （锁定秒数、未锁定当前秒数、冻结阈值）。
+6. 数据保存到 **SQLite**（WAL 模式，发布用 `BEGIN IMMEDIATE` 串行化），
+   Docker Compose 命名卷持久化，**重启后仍可读取**。
+
+### HTTP 调用示例
+
+#### 1）创建谱例（返回 ID 与修订号 0）
+
+```bash
+curl -s -X POST http://localhost:8000/scores \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ppq": 480,
+    "time_signatures": [],
+    "tempo_points": [
+      {"position": "1:1:0", "bpm": 120, "curve": "step"}
+    ],
+    "anchors": [
+      {"position": "1:1:0", "locked": true},
+      {"position": "2:1:0", "locked": false}
+    ]
+  }'
+```
+
+120 BPM、PPQ=480 下一拍 0.5 s、一 tick `0.5/480` s；`2:1:0` 即一小节
+后 = 2.0 s：
+
+```json
+{
+  "id": "ac0224ce71d34c90bbe6f3a917602bbe",
+  "revision": 0,
+  "ppq": 480,
+  "tempo_points": [{"position": "1:1:0", "bpm": 120.0, "curve": "step"}],
+  "anchors": [
+    {"index": 0, "position": "1:1:0", "locked": true,
+     "total_ticks": 0, "original_seconds": 0.0,
+     "current_seconds": 0.0, "tick_seconds": 0.0010416666666666667},
+    {"index": 1, "position": "2:1:0", "locked": false,
+     "total_ticks": 1920, "original_seconds": 2.0,
+     "current_seconds": 2.0, "tick_seconds": 0.0010416666666666075}
+  ]
+}
+```
+
+#### 2）预览整份替换速度点表（不改数据）
+
+把整体速度放慢到 60 BPM（`2:1:0` 由 2.0 s 变 4.0 s）：
+
+```bash
+SID=ac0224ce71d34c90bbe6f3a917602bbe
+curl -s -X POST http://localhost:8000/scores/$SID/revisions/0/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tempo_points": [{"position": "1:1:0", "bpm": 60, "curve": "step"}]
+  }'
+```
+
+```json
+{
+  "id": "ac0224ce71d34c90bbe6f3a917602bbe",
+  "expected_revision": 0,
+  "current_revision": 0,
+  "has_lock_conflict": false,
+  "anchors": [
+    {"index": 0, "position": "1:1:0", "locked": true,
+     "original_seconds": 0.0, "new_seconds": 0.0,
+     "offset_seconds": 0.0, "lock_conflict": false,
+     "tick_seconds": 0.0010416666666666667},
+    {"index": 1, "position": "2:1:0", "locked": false,
+     "original_seconds": 2.0, "new_seconds": 4.0,
+     "offset_seconds": 2.0, "lock_conflict": false,
+     "tick_seconds": 0.0010416666666666075}
+  ]
+}
+```
+
+> 若锁定锚点（如把 `2:1:0` 设为 `locked=true`）在新图下偏移超过一 tick，
+> 预览仍返回 **200**，但对应锚点 `lock_conflict=true`、
+> 顶层 `has_lock_conflict=true`；此时发布会被拒绝。
+
+#### 3）发布（修订号 0 → 1）
+
+```bash
+curl -s -X POST http://localhost:8000/scores/$SID/revisions/0/publish \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "tempo_points": [{"position": "1:1:0", "bpm": 60, "curve": "step"}]
+  }'
+```
+
+成功返回更新后的谱例（`revision` 变为 `1`）：**未锁定**锚点
+`2:1:0` 的 `current_seconds` 更新为 `4.0`；**锁定**锚点 `1:1:0`
+秒数保持 `0.0`，其冻结的 `original_seconds` / `tick_seconds` 不变。
+
+随后用**旧预期修订号**再发一次（哪怕中间只做过预览）会得到 **409**：
+
+```bash
+curl -i -X POST http://localhost:8000/scores/$SID/revisions/0/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"tempo_points": [{"position": "1:1:0", "bpm": 240, "curve": "step"}]}'
+# HTTP/1.1 409 Conflict
+# {"detail": [{"loc": ["path", "expected_revision"],
+#   "msg": "修订号冲突：预期 0，当前 1", "index": null,
+#   "expected_revision": 0, "current_revision": 1}]}
+```
+
+锁定冲突时返回带锚点索引的 **422**（数据保持原样、修订号不前进）：
+
+```json
+{
+  "detail": [
+    {"loc": ["body", "anchors", 1],
+     "msg": "锁定锚点 1（2:1:0）相对创建时保存的 2.000000s 偏移 +2.000000s，超过该位置录入时一 tick 的时长 0.001041667s",
+     "index": 1}
+  ]
+}
+```
+
+#### 4）查询同一版本的速度图与锚点
+
+```bash
+curl -s http://localhost:8000/scores/$SID
+# -> "revision": 1，"tempo_points" 为 60 BPM，锚点 current_seconds 与该版本一致
+```
 
 ---
 
@@ -332,6 +508,22 @@ BPM=0、速度点位置重复、拍号分母不是 2 的幂，会在同一个 42
 `curve` 非法；位置格式错误、拍超出当前拍号分子或 tick 超出单拍范围；
 `position`/`seconds` 同时提供或都不提供；`seconds` 为负或非有限值。
 
+修订接口还可能返回：
+
+- **404**：谱例 ID 不存在（`detail[0].loc` 指向 `path.score_id`）；
+- **409**：路径中的 `expected_revision` 与当前修订号不一致（预览后已有
+  其他发布，旧修订号仍须 409，不能覆盖新版本）：
+
+  ```json
+  {"detail": [{"loc": ["path", "expected_revision"],
+               "msg": "修订号冲突：预期 0，当前 1", "index": null,
+               "expected_revision": 0, "current_revision": 1}]}
+  ```
+
+- 发布修订时若**锁定锚点**相对创建时保存秒数的偏移**严格超过**
+  “该位置录入时一个 tick 的时长”，按上述 422 格式返回并带锚点 `index`，
+  速度图、锚点秒数与修订号均不变。
+
 ---
 
 ## 运行测试
@@ -345,19 +537,28 @@ pytest -q
 Simpson 数值积分交叉校验，误差 ~1e-14）、同段反求与边界归属、拍号切换、
 密集/随机点上的 ≤1 tick 往返、以及各类带索引的 422。
 
+修订相关测试（`tests/test_scores.py`）覆盖：创建冻结锚点秒数与一 tick
+阈值、预览返回原/新秒数与偏移且不落库、预览/发布的修订号 409、锁定冲突
+422（带锚点索引且数据不变）、偏移恰好等于一 tick 放行、成功发布原子更新
+速度图/未锁定锚点/修订号且锁定秒数不变、按当前修订连续发布、404，以及
+用独立 SQLite 文件重新打开（模拟 Compose 重启）后数据仍可读。
+
 ## 项目结构
 
 ```
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 路由、请求/响应模型、422 错误处理
-│   └── tempo.py       # 核心引擎：拍号展开、积分换算、同段求逆、校验
+│   ├── main.py        # FastAPI 路由、请求/响应模型、422/409/404 错误处理
+│   ├── tempo.py       # 核心引擎：拍号展开、积分换算、同段求逆、校验
+│   └── db.py          # SQLite 持久化：谱例/锚点/修订号，乐观锁原子发布
 ├── tests/
+│   ├── conftest.py    # 测试用临时 SQLite（TEMPO_DB_PATH）
 │   ├── test_tempo.py  # 引擎数值/往返/校验测试
-│   └── test_api.py    # /convert 端到端测试
+│   ├── test_api.py    # /convert 端到端测试
+│   └── test_scores.py # 修订创建/预览/发布/查询与持久化测试
 ├── Dockerfile
-├── docker-compose.yml
+├── docker-compose.yml # 命名卷 tempo-data -> /data（TEMPO_DB_PATH）
 ├── requirements.txt
 └── README.md
 ```

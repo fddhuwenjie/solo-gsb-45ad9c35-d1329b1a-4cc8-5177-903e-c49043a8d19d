@@ -3,6 +3,12 @@ services:
     build: .
     image: tempo-map-api:latest
     container_name: tempo-map-api
+    environment:
+      # SQLite 数据库放到命名卷；`docker compose down` 后再 up（卷保留）
+      # 已创建/发布的谱例仍可读取；`down -v` 才会清除。
+      TEMPO_DB_PATH: /data/tempo.db
+    volumes:
+      - tempo-data:/data
     ports:
       - "8000:8000"
     restart: unless-stopped
@@ -12,3 +18,6 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
+
+volumes:
+  tempo-data:

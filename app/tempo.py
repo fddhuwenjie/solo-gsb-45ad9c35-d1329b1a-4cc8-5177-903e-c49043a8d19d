@@ -214,6 +214,15 @@ class TempoMap:
         i = max(bisect_right(self.ticks, tick) - 1, 0)
         return self.prefix[i] + self._segment_seconds(i, tick - self.ticks[i])
 
+    def tick_seconds_at(self, tick: int | float) -> float:
+        """位置（绝对 tick）处**一个 tick** 的时长（秒）。
+
+        即该 tick 与下一 tick 的时间差，直接复用 :meth:`seconds_at_tick`
+        （阶梯段恒定、线性段解析积分），边界归属与正反向换算保持一致。
+        录音锚点录入时用它记录“该位置一 tick 的时长”，作为锁定偏移阈值。
+        """
+        return self.seconds_at_tick(tick + 1.0) - self.seconds_at_tick(tick)
+
     def tick_at_seconds(self, seconds: float) -> float:
         """秒 -> 位置（绝对 tick，浮点，未量化）。在同一速度段内解析求逆。"""
         if not math.isfinite(seconds) or seconds < 0:
