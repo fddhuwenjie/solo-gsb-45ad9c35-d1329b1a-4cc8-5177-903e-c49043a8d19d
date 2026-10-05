@@ -95,6 +95,23 @@ def test_linear_ramp_inverse_and_boundaries():
         assert tmap2.tick_at_seconds(t) == pytest.approx(float(tick), abs=1e-7)
 
 
+def test_bpm_and_tick_seconds_at():
+    tmap = make(points=[
+        {"position": "1:1:0", "bpm": 60, "curve": "linear"},
+        {"position": "2:1:0", "bpm": 120, "curve": "step"},
+    ])
+    # 线性段内按 tick 插值
+    assert tmap.bpm_at_tick(0) == pytest.approx(60)
+    assert tmap.bpm_at_tick(960) == pytest.approx(90)
+    # 边界 tick 归后一个速度点
+    assert tmap.bpm_at_tick(1920) == pytest.approx(120)
+    # 末个速度点之后保持末点 BPM
+    assert tmap.bpm_at_tick(99999) == pytest.approx(120)
+    # 一 tick 时长 = 60 / (BPM * PPQ)
+    assert tmap.tick_seconds_at(0) == pytest.approx(60.0 / (60 * PPQ))
+    assert tmap.tick_seconds_at(1920) == pytest.approx(60.0 / (120 * PPQ))
+
+
 def test_meter_change_3_4():
     tmap = make(meters=[{"measure": 3, "numerator": 3, "denominator": 4}])
     # 1、2 小节 4/4 = 1920；第 3 小节起 3/4 = 1440

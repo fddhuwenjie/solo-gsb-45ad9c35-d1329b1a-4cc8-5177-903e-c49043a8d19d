@@ -5,6 +5,11 @@ services:
     container_name: tempo-map-api
     ports:
       - "8000:8000"
+    environment:
+      # SQLite 数据库路径（挂命名卷，Compose 重启/重建后谱例仍可读取）
+      - TEMPO_MAP_DB_PATH=/app/data/scores.db
+    volumes:
+      - tempo-data:/app/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
@@ -12,3 +17,6 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
+
+volumes:
+  tempo-data:

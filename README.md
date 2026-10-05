@@ -4,13 +4,19 @@
 `小节:拍:tick` 与时间（秒）之间双向换算，支持 **PPQ**、**只在小节首拍
 生效的拍号表**，以及 **阶梯（step）/ 线性（linear）BPM** 速度点。
 
+在此基础上还提供**带录音锚点的谱例修订发布**：创建谱例（速度图 +
+锚点）后，可预览/发布整份替换速度点表，锚点秒数随版本演进，锁定锚点
+受“一 tick 时长”漂移约束保护；谱例持久化到 **SQLite**，重启后仍可读取。
+
 - 位置中的“拍”按**当前拍号分母**对应的音符计（6/8 中一拍 = 八分音符）；
 - 内部统一展开为“距乐谱起点的 **tick 坐标**”（PPQ：每四分音符的 tick 数）；
 - 线性速度段按解析积分换算，反向换算在**同一速度段内解析求逆**；
 - 正反向边界归属一致（边界 tick 归后一个速度点，右连续）；
 - 往返误差 ≤ **1 tick**（响应中直接给出残差与判定）；
 - 非法拍号、速度点非递增、BPM 非正等情况返回 **422**，错误项带有
-  出错的**数组索引** `index`。
+  出错的**数组索引** `index`；
+- 谱例发布采用**乐观并发**：预期修订号不一致返回 **409**；锁定锚点
+  偏移超过录入时一 tick 时长返回带锚点索引的 **422**，数据不变。
 
 ---
 
@@ -23,6 +29,7 @@
 - [请求字段](#请求字段)
 - [响应字段](#响应字段)
 - [示例](#示例)
+- [谱例：带录音锚点的修订发布](#谱例带录音锚点的修订发布)
 - [错误响应（422，含索引）](#错误响应422含索引)
 - [运行测试](#运行测试)
 - [项目结构](#项目结构)
@@ -42,9 +49,15 @@ docker compose up --build
 - 本机地址：<http://localhost:8000>
 - 健康检查：<http://localhost:8000/health>
 - 接口：`POST http://localhost:8000/convert`
+- 谱例：`POST/GET http://localhost:8000/scores`（详见
+  [谱例：带录音锚点的修订发布](#谱例带录音锚点的修订发布)）
 - Swagger 交互文档：<http://localhost:8000/docs>
 - ReDoc：<http://localhost:8000/redoc>
 - OpenAPI Schema：<http://localhost:8000/openapi.json>
+
+谱例数据保存在 SQLite（容器内 `/app/data/scores.db`，挂载命名卷
+`tempo-data`）；`docker compose restart` 或 `down` 后重新 `up` 数据仍在。
+删除数据：`docker compose down -v`。
 
 停止：`docker compose down`（后台运行：`docker compose up --build -d`）。
 
@@ -56,7 +69,8 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-地址同上。
+地址同上。本地运行时 SQLite 默认写到 `./data/scores.db`，可用环境变量
+`TEMPO_MAP_DB_PATH` 指定其他路径。
 
 ---
 
@@ -296,6 +310,166 @@ curl -s -X POST http://localhost:8000/convert \
 
 ---
 
+## 谱例：带录音锚点的修订发布
+
+谱例（score）把一份速度图（PPQ + 拍号表 + 速度点表）和一组**录音锚点**
+（乐谱位置 + 锁定标志）保存为一个可修订的对象，持久化在 SQLite 中：
+
+| 接口 | 说明 |
+|---|---|
+| `POST /scores` | 创建谱例，返回谱例 ID 与修订号 `0` |
+| `GET /scores/{score_id}` | 查询谱例：返回同一修订版本的速度图与锚点 |
+| `POST /scores/{score_id}/preview` | 预览整份替换速度点表（不修改已存数据） |
+| `POST /scores/{score_id}/publish` | 发布整份替换速度点表（修订号 +1） |
+
+规则：
+
+- **创建**：提交 PPQ、拍号、速度点及锚点（位置 + `locked` 标志，**至少
+  一个锁定**）；服务按原图计算并保存各锚点秒数，同时记录**录入时该位置
+  一 tick 的时长**（`60 / (BPM(位置) * PPQ)`）作为锁定漂移容忍度。
+- **预览**：凭谱例 ID 和**预期修订号**提交整份替换速度点表；返回各锚点的
+  原秒数、新秒数、偏移及锁定冲突标志，**不修改已存数据**。
+- **发布**：按**当前修订**重新计算——锁定锚点相对**创建时保存的秒数**
+  若偏移超过录入时该位置一 tick 的时长，返回**带锚点索引的 422** 且数据
+  不变；成功则在**一个事务**内更新速度图、未锁定锚点秒数和修订号，
+  **锁定锚点秒数不变**。
+- **乐观并发**：预览/发布的 `expected_revision` 与当前修订不一致时返回
+  **409**（响应带 `current_revision`）。预览后若有其他发布成功，旧预期
+  修订号再提交仍返回 409，不会覆盖新版本。
+
+### 创建谱例
+
+```bash
+curl -s -X POST http://localhost:8000/scores \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ppq": 480,
+    "time_signatures": [{"measure": 1, "numerator": 4, "denominator": 4}],
+    "tempo_points": [
+      {"position": "1:1:0", "bpm": 120, "curve": "step"},
+      {"position": "3:1:0", "bpm": 60,  "curve": "step"}
+    ],
+    "anchors": [
+      {"position": "2:1:0", "locked": true},
+      {"position": "4:1:0", "locked": false}
+    ]
+  }'
+```
+
+响应（201）：锚点秒数已按原图计算保存（2:1:0 → 2.0s，4:1:0 → 8.0s）。
+
+```json
+{
+  "score_id": "0be4745afeda4b2f8f8d4bc1eb238cf3",
+  "revision": 0,
+  "ppq": 480,
+  "time_signatures": [{"measure": 1, "numerator": 4, "denominator": 4}],
+  "tempo_points": [
+    {"position": "1:1:0", "bpm": 120.0, "curve": "step"},
+    {"position": "3:1:0", "bpm": 60.0, "curve": "step"}
+  ],
+  "anchors": [
+    {"index": 0, "position": "2:1:0", "locked": true,  "seconds": 2.0},
+    {"index": 1, "position": "4:1:0", "locked": false, "seconds": 8.0}
+  ]
+}
+```
+
+### 预览替换速度点表
+
+```bash
+curl -s -X POST http://localhost:8000/scores/<score_id>/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_revision": 0,
+    "tempo_points": [
+      {"position": "1:1:0", "bpm": 120, "curve": "step"},
+      {"position": "3:1:0", "bpm": 240, "curve": "step"}
+    ]
+  }'
+```
+
+响应（200）：各锚点原秒数 / 新秒数 / 偏移 / 锁定冲突一目了然
+（`tolerance_seconds` 即录入时该位置一 tick 的时长），已存数据不变。
+
+```json
+{
+  "score_id": "0be4745afeda4b2f8f8d4bc1eb238cf3",
+  "revision": 0,
+  "has_lock_conflicts": false,
+  "anchors": [
+    {"index": 0, "position": "2:1:0", "locked": true,
+     "original_seconds": 2.0, "new_seconds": 2.0, "offset_seconds": 0.0,
+     "tolerance_seconds": 0.0010416666666666667, "lock_conflict": false},
+    {"index": 1, "position": "4:1:0", "locked": false,
+     "original_seconds": 8.0, "new_seconds": 5.0, "offset_seconds": -3.0,
+     "tolerance_seconds": 0.0020833333333333333, "lock_conflict": false}
+  ]
+}
+```
+
+### 发布替换速度点表
+
+请求体与预览相同：
+
+```bash
+curl -s -X POST http://localhost:8000/scores/<score_id>/publish \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_revision": 0,
+    "tempo_points": [
+      {"position": "1:1:0", "bpm": 120, "curve": "step"},
+      {"position": "3:1:0", "bpm": 240, "curve": "step"}
+    ]
+  }'
+```
+
+成功响应（200）：`revision` 变为 `1`，速度图与未锁定锚点秒数已更新，
+锁定锚点秒数保持创建时的保存值（2.0s）。
+
+```json
+{
+  "score_id": "0be4745afeda4b2f8f8d4bc1eb238cf3",
+  "revision": 1,
+  "anchors": [
+    {"index": 0, "position": "2:1:0", "locked": true,  "seconds": 2.0},
+    {"index": 1, "position": "4:1:0", "locked": false, "seconds": 5.0}
+  ]
+}
+```
+
+失败情形：
+
+- **锁定漂移超限 → 422**（带锚点索引，数据不变）。例如把全图提速到
+  240 BPM，锁定锚点 `2:1:0` 的秒数将从 2.0 变为 1.0，偏移 −1.0s 远超
+  一 tick 时长 0.00104s：
+
+  ```json
+  {"detail": [{"loc": ["body", "anchors", 0],
+    "msg": "锁定锚点 2:1:0 的秒数相对创建时保存值 2.000000 偏移 -1.000000 秒，超过录入时该位置一 tick 的时长 0.001042 秒",
+    "index": 0}]}
+  ```
+
+- **修订号冲突 → 409**。预览之后若有其他发布成功，再用旧的
+  `expected_revision` 提交预览或发布都会返回 409，新版本不会被覆盖：
+
+  ```json
+  {"detail": [{"loc": ["body", "expected_revision"],
+    "msg": "预期修订号 0 与谱例当前修订 1 不一致：期间已有其他发布，请重新查询并预览后再提交",
+    "index": null, "current_revision": 1}]}
+  ```
+
+### 查询谱例
+
+```bash
+curl -s http://localhost:8000/scores/<score_id>
+```
+
+返回同一修订版本的速度图与锚点（速度点表、锚点秒数与 `revision` 来自
+同一次提交，永不混杂）。谱例不存在时返回 404。
+
+---
+
 ## 错误响应（422，含索引）
 
 所有请求体级别的语义/结构错误统一返回 HTTP **422**，`detail` 为错误
@@ -343,7 +517,8 @@ pytest -q
 
 测试覆盖：分母计拍坐标展开（含 6/8 复合拍号）、阶梯/线性速度（解析式与
 Simpson 数值积分交叉校验，误差 ~1e-14）、同段反求与边界归属、拍号切换、
-密集/随机点上的 ≤1 tick 往返、以及各类带索引的 422。
+密集/随机点上的 ≤1 tick 往返、各类带索引的 422，以及谱例的创建/查询/
+预览/发布、锁定漂移 422、修订冲突 409 与 SQLite 重开持久化。
 
 ## 项目结构
 
@@ -351,11 +526,14 @@ Simpson 数值积分交叉校验，误差 ~1e-14）、同段反求与边界归�
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 路由、请求/响应模型、422 错误处理
-│   └── tempo.py       # 核心引擎：拍号展开、积分换算、同段求逆、校验
+│   ├── main.py        # FastAPI 路由、请求/响应模型、422/409 错误处理
+│   ├── tempo.py       # 核心引擎：拍号展开、积分换算、同段求逆、校验
+│   └── db.py          # 谱例/锚点的 SQLite 持久化（事务化发布）
 ├── tests/
+│   ├── conftest.py    # 测试用临时 SQLite 路径
 │   ├── test_tempo.py  # 引擎数值/往返/校验测试
-│   └── test_api.py    # /convert 端到端测试
+│   ├── test_api.py    # /convert 端到端测试
+│   └── test_scores.py # 谱例创建/预览/发布/持久化测试
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

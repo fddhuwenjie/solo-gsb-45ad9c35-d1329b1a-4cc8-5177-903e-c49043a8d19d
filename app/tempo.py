@@ -246,6 +246,25 @@ class TempoMap:
         b_at_t = b0 * math.exp(elapsed / a)
         return self.ticks[i] + span * (b_at_t - b0) / db
 
+    def bpm_at_tick(self, tick: int | float) -> float:
+        """该 tick 处的瞬时 BPM。
+
+        边界归属与计时规则一致（边界 tick 归后一个速度点）；线性段内按
+        tick 线性插值，末个速度点之后保持末点 BPM。
+        """
+        i = max(bisect_right(self.ticks, tick) - 1, 0)
+        if self.curves[i] != "linear" or i >= len(self.ticks) - 1:
+            return self.bpms[i]
+        span = self.ticks[i + 1] - self.ticks[i]
+        if span <= 0:
+            return self.bpms[i]
+        frac = (tick - self.ticks[i]) / span
+        return self.bpms[i] + (self.bpms[i + 1] - self.bpms[i]) * frac
+
+    def tick_seconds_at(self, tick: int | float) -> float:
+        """该位置一个 tick 的时长（秒）：60 / (BPM(tick) * PPQ)。"""
+        return 60.0 / (self.bpm_at_tick(tick) * self.ppq)
+
 
 # ---------------------------------------------------------------------- #
 # 构建（含全部带索引的语义校验）
